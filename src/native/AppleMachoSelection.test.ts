@@ -1,3 +1,4 @@
+import { readFatContainerHeader } from "../domain/apple/machoContainer.js";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -34,6 +35,22 @@ it("keeps unknown magic distinct from recognized unsupported Mach-O formats", ()
   expect(failure).toBeInstanceOf(TypeError);
   expect(failure).not.toBeInstanceOf(UnsupportedMachoMetadataFormatError);
 });
+
+it.each([
+  { magic: 0xfeedface, headerSize: 28 },
+  { magic: 0xcefaedfe, headerSize: 28 },
+  { magic: 0xfeedfacf, headerSize: 32 },
+  { magic: 0xcffaedfe, headerSize: 32 },
+])(
+  "reports a recognized truncated header before CPU admission ($magic)",
+  ({ magic, headerSize }) => {
+    const bytes = Buffer.alloc(headerSize - 1);
+    bytes.writeUInt32BE(magic);
+    expect(() => parseMachoLayout(bytes, "unrecognized")).toThrow(
+      new RangeError("Truncated Mach-O header"),
+    );
+  },
+);
 
 const registerThinCpuFamilyControls = (): void => {
   it.each([
@@ -324,3 +341,26 @@ describe("native Mach-O fixup load command boundaries", () => {
     ]);
   });
 });
+
+it.each([0, 129])(
+  "preserves native FAT selection policy separately from generic identity admission (count %i)",
+  (count) => {
+    const bytes = Buffer.alloc(8);
+    bytes.writeUInt32BE(0xcafebabe);
+    bytes.writeUInt32BE(count, 4);
+    expect(readFatContainerHeader(bytes, bytes.length)).toEqual(
+      count === 0
+        ? { state: "malformed", reason: "FAT header declares no architectures" }
+        : { state: "not-fat" },
+    );
+    expect(() => selectMachoSlice(bytes, "arm64")).toThrow(
+      count === 0
+        ? new TypeError(
+            "Requested FAT architecture is absent (FAT header byte order: big-endian)",
+          )
+        : new RangeError(
+            "Malformed FAT architecture table (FAT header byte order: big-endian)",
+          ),
+    );
+  },
+);

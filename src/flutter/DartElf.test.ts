@@ -502,3 +502,105 @@ describe("readSnapshotHeader", () => {
     });
   });
 });
+
+it("keeps section admission ahead of program admission for unrepresentable raw offsets", async () => {
+  const bytes = buildStrippedElf64Image([]);
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, 0x28);
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, 0x20);
+  expect(await readElfSymbols(bytes, ["_kDartVmSnapshotData"])).toEqual({
+    symbols: [],
+    failures: [
+      { reason: "ELF section header table is missing or out of bounds" },
+    ],
+  });
+  bytes.writeBigUInt64LE(0n, 0x28);
+  expect(await readElfSymbols(bytes, ["_kDartVmSnapshotData"])).toEqual({
+    symbols: [],
+    failures: [
+      { reason: "ELF program header table is missing or out of bounds" },
+    ],
+  });
+});
+
+it("checks raw symbol precision only after definition and requested-name selection", async () => {
+  const bytes = buildElf64Image([
+    { name: "unselected", value: 64, size: 4 },
+    { name: "selected", value: 64, size: 4 },
+  ]);
+  const expected = await readElfSymbols(bytes, ["selected"]);
+  const sectionTable = Number(bytes.readBigUInt64LE(0x28));
+  const symbols = Number(bytes.readBigUInt64LE(sectionTable + 64 + 0x18));
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, symbols + 8);
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, symbols + 16);
+  expect(await readElfSymbols(bytes, ["selected"])).toEqual(expected);
+  expect(await readElfSymbols(bytes, ["unselected"])).toEqual({
+    symbols: [],
+    failures: [{ reason: "Symbol unselected has unrepresentable bounds" }],
+  });
+  bytes.writeUInt16LE(0, symbols + 6);
+  expect(await readElfSymbols(bytes, ["unselected"])).toEqual({
+    symbols: [],
+    failures: [
+      { reason: "symbol unselected is not in the dynamic symbol table" },
+    ],
+  });
+});
+
+it("keeps precision admission limited to consumed ELF program fields and types", async () => {
+  const original = buildElf64Image([{ name: "selected", value: 64, size: 4 }]);
+  const expected = await readElfSymbols(original, ["selected"]);
+  const bytes = appendElfRanges(original, "program", [
+    { type: 0x70000001, offset: 0, size: 0 },
+  ]);
+  const table = Number(bytes.readBigUInt64LE(32));
+  const width = bytes.readUInt16LE(54);
+  for (const relative of [8, 16, 24, 32, 40, 48])
+    bytes.writeBigUInt64LE(0xffffffffffffffffn, table + width + relative);
+  // The load mapping does not consume physical address, memory size or alignment.
+  for (const relative of [24, 40, 48])
+    bytes.writeBigUInt64LE(0xffffffffffffffffn, table + relative);
+  expect(await readElfSymbols(bytes, ["selected"])).toEqual(expected);
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, table + 32);
+  expect(await readElfSymbols(bytes, ["selected"])).toEqual({
+    symbols: [],
+    failures: [{ reason: "ELF segment 0 is not file-backed" }],
+  });
+});
+
+it("keeps section precision checks on consumed declarations and mapping fields", async () => {
+  const bytes = buildElf64Image([{ name: "selected", value: 64, size: 4 }]);
+  const expected = await readElfSymbols(bytes, ["selected"]);
+  const table = Number(bytes.readBigUInt64LE(40));
+  // An unrelated null record may carry uninterpreted declaration words.
+  for (const relative of [8, 16, 24, 32, 48, 56])
+    bytes.writeBigUInt64LE(0xffffffffffffffffn, table + relative);
+  // Alignment is not consumed for this symbol-table mapping.
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, table + 64 + 48);
+  expect(await readElfSymbols(bytes, ["selected"])).toEqual(expected);
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, table + 64 + 8);
+  expect(await readElfSymbols(bytes, ["selected"])).toEqual({
+    symbols: [],
+    failures: [
+      { reason: "Dynamic symbol table has an unrepresentable section header" },
+    ],
+  });
+});
+
+it("keeps ignored DT_NULL payloads separate from unsigned tag precision admission", async () => {
+  const names = ["_kDartVmSnapshotData"];
+  const control = await readElfSymbols(strippedImageWithSections(), names);
+  expect(control.failures).toEqual([]);
+  expect(
+    await readElfSymbols(
+      strippedImageWithSections([[0, 0xffffffffffffffffn]]),
+      names,
+    ),
+  ).toEqual(control);
+  const bytes = strippedImageWithSections([[16, 0n]]);
+  const table = Number(bytes.readBigUInt64LE(64 + 56 + 8));
+  bytes.writeBigInt64LE(-1n, table + 5 * 16);
+  expect(await readElfSymbols(bytes, names)).toEqual({
+    symbols: [],
+    failures: [{ reason: "Dynamic entry is not representable" }],
+  });
+});
